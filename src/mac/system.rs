@@ -19,6 +19,7 @@ use std::mem;
 use std::sync::Arc;
 
 use libc::{self, c_int, c_void, size_t, sysconf, _SC_PAGESIZE};
+use sys::ffi::{host_statistics64, HOST_VM_INFO64, HOST_VM_INFO64_COUNT, KERN_SUCCESS, vm_statistics64};
 
 use rayon::prelude::*;
 
@@ -27,12 +28,13 @@ pub struct System {
     process_list: HashMap<Pid, Process>,
     mem_total: u64,
     mem_free: u64,
+    mem_used: u64,
     mem_available: u64,
     swap_total: u64,
     swap_free: u64,
     global_processor: Processor,
     processors: Vec<Processor>,
-    page_size_kb: u64,
+    page_size_b: u64,
     components: Vec<Component>,
     connection: Option<ffi::io_connect_t>,
     disks: Vec<Disk>,
@@ -96,21 +98,46 @@ fn boot_time() -> u64 {
     }
 }
 
+
+unsafe fn get_sys_value2(
+    mut len: usize,
+    value: *mut libc::c_void,
+    mib: &mut [i32],
+) -> bool {
+    unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as _,
+            value,
+            &mut len as *mut _,
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+    }
+}
+
 impl SystemExt for System {
     fn new_with_specifics(refreshes: RefreshKind) -> System {
         let port = unsafe { ffi::mach_host_self() };
         let (global_processor, processors) = init_processors(port);
-
+        let mut page_size_b: usize = 0;
+        unsafe{
+            let res = ffi::host_page_size(port, &mut page_size_b);
+            if res != KERN_SUCCESS {
+                page_size_b = sysconf(_SC_PAGESIZE) as usize;
+            }
+        }
         let mut s = System {
             process_list: HashMap::with_capacity(200),
             mem_total: 0,
             mem_free: 0,
+            mem_used: 0,
             mem_available: 0,
             swap_total: 0,
             swap_free: 0,
             global_processor,
             processors,
-            page_size_kb: unsafe { sysconf(_SC_PAGESIZE) as u64 / 1_000 },
+            page_size_b: page_size_b as u64,
             components: Vec::with_capacity(2),
             connection: get_io_service_connection(),
             disks: Vec::with_capacity(1),
@@ -124,41 +151,39 @@ impl SystemExt for System {
     }
 
     fn refresh_memory(&mut self) {
-        let mut mib = [0, 0];
+        let mut mib = [libc::CTL_VM as _, libc::VM_SWAPUSAGE as _];
 
         unsafe {
             // get system values
             // get swap info
-            let mut xs: ffi::xsw_usage = mem::zeroed::<ffi::xsw_usage>();
-            if get_sys_value(
-                ffi::CTL_VM,
-                ffi::VM_SWAPUSAGE,
-                mem::size_of::<ffi::xsw_usage>(),
-                &mut xs as *mut ffi::xsw_usage as *mut c_void,
+            let mut xs: libc::xsw_usage = mem::zeroed::<libc::xsw_usage>();
+            if get_sys_value2(
+                mem::size_of::<libc::xsw_usage>(),
+                &mut xs as *mut _ as *mut c_void,
                 &mut mib,
             ) {
-                self.swap_total = xs.xsu_total / 1_000;
-                self.swap_free = xs.xsu_avail / 1_000;
+                self.swap_total = xs.xsu_total;
+                self.swap_free = xs.xsu_avail;
             }
+            mib[0] = libc::CTL_HW as _;
+            mib[1] = libc::HW_MEMSIZE as _;
             // get ram info
             if self.mem_total < 1 {
-                get_sys_value(
-                    ffi::CTL_HW,
-                    ffi::HW_MEMSIZE,
+                get_sys_value2(
                     mem::size_of::<u64>(),
                     &mut self.mem_total as *mut u64 as *mut c_void,
                     &mut mib,
                 );
-                self.mem_total /= 1_000;
             }
-            let count: u32 = ffi::HOST_VM_INFO64_COUNT;
-            let mut stat = mem::zeroed::<ffi::vm_statistics64>();
-            if ffi::host_statistics64(
+            let mut count: u32 = HOST_VM_INFO64_COUNT as _;
+            let mut stat = mem::zeroed::<vm_statistics64>();
+            
+            if host_statistics64(
                 self.port,
-                ffi::HOST_VM_INFO64,
-                &mut stat as *mut ffi::vm_statistics64 as *mut c_void,
-                &count,
-            ) == ffi::KERN_SUCCESS
+                HOST_VM_INFO64,
+                &mut stat as *mut vm_statistics64 as *mut _,
+                &mut count,
+            ) == KERN_SUCCESS
             {
                 // From the apple documentation:
                 //
@@ -168,14 +193,21 @@ impl SystemExt for System {
                 //  * used to hold data that was read speculatively from disk but
                 //  * haven't actually been used by anyone so far.
                 //  */
-                self.mem_available = self.mem_total
-                    - (u64::from(stat.active_count)
-                        + u64::from(stat.inactive_count)
-                        + u64::from(stat.wire_count)
-                        + u64::from(stat.speculative_count)
-                        - u64::from(stat.purgeable_count))
-                        * self.page_size_kb;
-                self.mem_free = u64::from(stat.free_count) * self.page_size_kb;
+                self.mem_available = u64::from(stat.free_count)
+                    .saturating_add(u64::from(stat.inactive_count))
+                    .saturating_add(u64::from(stat.purgeable_count))
+                    .saturating_sub(u64::from(stat.compressor_page_count))
+                    .saturating_mul(self.page_size_b);
+                self.mem_used = u64::from(stat.active_count)
+                    .saturating_add(u64::from(stat.wire_count))
+                    .saturating_add(u64::from(stat.compressor_page_count))
+                    // .saturating_add(u64::from(stat.total_uncompressed_pages_in_compressor))
+                    .saturating_add(u64::from(stat.speculative_count))
+                    .saturating_mul(self.page_size_b);
+                // self.mem_used = u64::from(stat.wire_count).saturating_mul(16384);
+                self.mem_free = u64::from(stat.free_count)
+                    .saturating_sub(u64::from(stat.speculative_count))
+                    .saturating_mul(self.page_size_b);
             }
         }
     }
@@ -333,7 +365,7 @@ impl SystemExt for System {
     }
 
     fn get_used_memory(&self) -> u64 {
-        self.mem_total - self.mem_free
+        self.mem_used
     }
 
     fn get_total_swap(&self) -> u64 {

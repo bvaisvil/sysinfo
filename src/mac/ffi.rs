@@ -4,7 +4,7 @@
 // Copyright (c) 2015 Guillaume Gomez
 //
 
-use libc::{c_char, c_int, c_uchar, c_uint, c_ushort, c_void, size_t};
+use libc::{c_char, c_int, c_uchar, c_uint, c_ushort, c_void, size_t, vm_size_t};
 
 extern "C" {
     #[no_mangle]
@@ -102,6 +102,7 @@ extern "C" {
     pub fn mach_task_self() -> u32;
     pub fn mach_host_self() -> u32;
     //pub fn task_info(host_info: u32, t: u32, c: *mut c_void, x: *mut u32) -> u32;
+    pub fn host_page_size(host_info: u32, out_page_size: *mut vm_size_t) -> kern_return_t;
     pub fn host_statistics64(
         host_info: u32,
         x: u32,
