@@ -14,9 +14,11 @@ use sys::processor::*;
 use {LoadAvg, Pid, ProcessExt, ProcessorExt, RefreshKind, SystemExt, User};
 
 use std::cell::UnsafeCell;
+use std::convert::TryInto;
 use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
+use std::ffi::CString;
 
 use libc::{self, c_int, c_void, size_t, sysconf, _SC_PAGESIZE};
 use sys::ffi::{host_statistics64, HOST_VM_INFO64, HOST_VM_INFO64_COUNT, KERN_SUCCESS, vm_statistics64};
@@ -95,6 +97,19 @@ fn boot_time() -> u64 {
         0
     } else {
         boot_time.tv_sec as _
+    }
+}
+
+
+fn get_vm_page_pageable_internal_count() -> Option<u64> {
+    let mut buf: Vec<u8> = vec![0; 8];
+    let c = CString::new("vm.page_pageable_internal_count").ok()?;
+    let mut len: usize = 8;
+    unsafe {
+        if ffi::sysctlbyname(c.as_ptr(), buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        Some(u64::from_ne_bytes(buf[..8].try_into().ok()?))
     }
 }
 
@@ -198,16 +213,18 @@ impl SystemExt for System {
                     .saturating_add(u64::from(stat.purgeable_count))
                     .saturating_sub(u64::from(stat.compressor_page_count))
                     .saturating_mul(self.page_size_b);
-                let app_mem = u64::from(stat.internal_page_count)
-                    .saturating_sub(u64::from(stat.purgeable_count));
-                let wired_mem = u64::from(stat.wire_count);
-                let compressed_mem= u64::from(stat.compressor_page_count);
-                self.mem_used = app_mem
-                    .saturating_add(compressed_mem)
-                    .saturating_add(wired_mem)
-                    .saturating_mul(self.page_size_b);
-                    
 
+                if let Some(pageable_internal) = get_vm_page_pageable_internal_count() {
+                    let app_mem = pageable_internal
+                        .saturating_sub(u64::from(stat.purgeable_count));
+                    let wired_mem = u64::from(stat.wire_count);
+                    let compressed_mem= u64::from(stat.compressor_page_count);
+                    self.mem_used = app_mem
+                        .saturating_add(compressed_mem)
+                        .saturating_add(wired_mem)
+                        .saturating_mul(self.page_size_b);
+                }
+                
                 /* alternative computation used by htop: 
                    https://github.com/htop-dev/htop/blob/9270bbc8a05806c27fa60e4c7c491c58bd58bcf0/darwin/Platform.c#L406
                    Both seem to give similar results.
