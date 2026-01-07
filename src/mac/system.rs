@@ -198,27 +198,28 @@ impl SystemExt for System {
                     .saturating_add(u64::from(stat.purgeable_count))
                     .saturating_sub(u64::from(stat.compressor_page_count))
                     .saturating_mul(self.page_size_b);
-                let app_mem = u64::from(stat.internal_page_count).saturating_sub(u64::from(stat.purgeable_count));
+                let app_mem = u64::from(stat.internal_page_count)
+                    .saturating_sub(u64::from(stat.purgeable_count));
                 let wired_mem = u64::from(stat.wire_count);
-                let compressed_mem = u64::from(stat.compressor_page_count);
+                let compressed_mem= u64::from(stat.compressor_page_count);
+                self.mem_used = app_mem
+                    .saturating_add(compressed_mem)
+                    .saturating_add(wired_mem)
+                    .saturating_mul(self.page_size_b);
+                    
+
+                /* alternative computation used by htop: 
+                   https://github.com/htop-dev/htop/blob/9270bbc8a05806c27fa60e4c7c491c58bd58bcf0/darwin/Platform.c#L406
+                   Both seem to give similar results.
+                 */
                 // self.mem_used = u64::from(stat.active_count)
+                //     .saturating_add(u64::from(stat.inactive_count))
+                //     .saturating_add(u64::from(stat.speculative_count))
                 //     .saturating_add(u64::from(stat.wire_count))
                 //     .saturating_add(u64::from(stat.compressor_page_count))
-                //     // .saturating_add(u64::from(stat.total_uncompressed_pages_in_compressor))
-                //     .saturating_add(u64::from(stat.speculative_count))
+                //     .saturating_sub(u64::from(stat.purgeable_count))
+                //     .saturating_sub(u64::from(stat.external_page_count))
                 //     .saturating_mul(self.page_size_b);
-                // self.mem_used = app_mem
-                //     .saturating_add(wired_mem)
-                //     .saturating_add(compressed_mem)
-                //     .saturating_mul(self.page_size_b);
-                self.mem_used = u64::from(stat.active_count)
-                    .saturating_add(u64::from(stat.inactive_count))
-                    .saturating_add(u64::from(stat.speculative_count))
-                    .saturating_add(u64::from(stat.wire_count))
-                    .saturating_add(u64::from(stat.compressor_page_count))
-                    .saturating_sub(u64::from(stat.purgeable_count))
-                    .saturating_sub(u64::from(stat.external_page_count))
-                    .saturating_mul(self.page_size_b);
                 self.mem_free = u64::from(stat.free_count)
                     .saturating_sub(u64::from(stat.speculative_count))
                     .saturating_mul(self.page_size_b);
@@ -381,6 +382,7 @@ impl SystemExt for System {
     fn get_used_memory(&self) -> u64 {
         self.mem_used
     }
+    
 
     fn get_total_swap(&self) -> u64 {
         self.swap_total
